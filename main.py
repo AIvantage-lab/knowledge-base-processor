@@ -130,14 +130,15 @@ async def process_document(request: ProcessDocumentRequest):
         # Paso 4: Generar hash del documento
         doc_hash = hashlib.md5(file_content).hexdigest()
         
-        # Paso 5: Insertar en record_manager_v2
+        # Paso 5: Insertar en record_manager_v2 (MODIFICADO: ahora incluye library_id)
         record_data = {
             "file_path": request.file_url,
             "file_name": request.file_name,
             "content_hash": doc_hash,
             "status": "processing",
             "total_chunks": len(chunks),
-            "processed_chunks": 0
+            "processed_chunks": 0,
+            "library_id": request.library_id  # NUEVO: referencia al libro
         }
         
         record_result = supabase.table("record_manager_v2").insert(record_data).execute()
@@ -151,10 +152,8 @@ async def process_document(request: ProcessDocumentRequest):
         record_id = record_result.data[0]['id']
         print(f"Record creado: {record_id}")
         
-        # Actualizar AIvantage_library con el record_id
-        supabase.table("AIvantage_library").update({
-            "record_id": record_id
-        }).eq("id", request.library_id).execute()
+        # ELIMINADO: Ya no actualizamos record_id en AIvantage_library
+        # La relación ahora es inversa: record_manager_v2.library_id -> AIvantage_library.id
         
         # Paso 6: Procesar chunks en lotes
         batch_size = 20
@@ -261,11 +260,10 @@ async def process_document(request: ProcessDocumentRequest):
             if current_library_data.data:
                 current_data = current_library_data.data[0]
                 
-                # Comparar y actualizar si corresponde
+                # Comparar y actualizar si corresponde (MODIFICADO: usa library_id)
                 metadata_result = await compare_and_update_metadata(
                     extracted_metadata=extracted_metadata,
                     library_id=request.library_id,
-                    record_id=record_id,
                     current_data=current_data,
                     supabase=supabase
                 )
@@ -306,6 +304,8 @@ async def process_document(request: ProcessDocumentRequest):
         except:
             pass
         raise HTTPException(status_code=500, detail=str(e))
+
+
 # ============================================================
 # FUNCIÓN DE FORMATEO DE FECHA
 # ============================================================
@@ -390,6 +390,7 @@ def format_publication_date(date_string: str) -> str:
         print(f"Error formateando fecha '{date_string}': {str(e)}")
         return "NO_IDENTIFICADO"
 
+
 # ============================================================
 # FUNCIÓN DE COMPARACIÓN Y ACTUALIZACIÓN DE METADATA
 # ============================================================
@@ -397,12 +398,13 @@ def format_publication_date(date_string: str) -> str:
 async def compare_and_update_metadata(
     extracted_metadata: Dict[str, Any],
     library_id: str,
-    record_id: str,
     current_data: Dict[str, Any],
     supabase: Client
 ) -> Dict[str, Any]:
     """
     Compara la metadata extraída con la existente y actualiza si corresponde.
+    
+    MODIFICADO: Ahora busca documentos por library_id en metadata en lugar de record_id.
     
     Reglas:
     - Si campo vacío y hay dato extraído → actualizar con dato extraído
@@ -501,11 +503,13 @@ async def compare_and_update_metadata(
             ).eq("id", library_id).execute()
             print(f"AIvantage_library actualizado: {updates_library}")
         
-        # Actualizar metadata en documents_v2 (todos los chunks del documento)
+        # Actualizar metadata en documents_v2 (todos los chunks del libro)
+        # MODIFICADO: Ahora busca por library_id en metadata en lugar de record_id
+        docs_result = None
         if updates_documents:
-            # Obtener todos los documentos con este record_id
-            docs_result = supabase.table("documents_v2").select("id, metadata").eq(
-                "record_id", record_id
+            # Obtener todos los documentos con este library_id en metadata
+            docs_result = supabase.table("documents_v2").select("id, metadata").filter(
+                "metadata->>library_id", "eq", library_id
             ).execute()
             
             if docs_result.data:
@@ -525,7 +529,7 @@ async def compare_and_update_metadata(
             "changes_made": changes_made,
             "updates_library": updates_library,
             "updates_documents": updates_documents,
-            "total_chunks_updated": len(docs_result.data) if updates_documents and docs_result.data else 0
+            "total_chunks_updated": len(docs_result.data) if updates_documents and docs_result and docs_result.data else 0
         }
         
     except Exception as e:
@@ -535,6 +539,7 @@ async def compare_and_update_metadata(
             "error": str(e),
             "changes_made": []
         }
+
 
 # ============================================================
 # FUNCIÓN DE EXTRACCIÓN DE METADATA CON LLM
@@ -550,75 +555,53 @@ async def extract_metadata_with_llm(
     Analiza los primeros y últimos chunks donde típicamente está esta información.
     """
     try:
-        # Tomar los primeros 3 chunks y los últimos 2 chunks
-        chunks_to_analyze = []
+        # Obtener los primeros chunks (portada, índice, introducción)
+        first_chunks = chunks[:3] if len(chunks) >= 3 else chunks
+        # Obtener los últimos chunks (bibliografía, contraportada)
+        last_chunks = chunks[-2:] if len(chunks) >= 2 else []
         
-        # Primeros chunks (portada, créditos, índice)
-        for i in range(min(3, len(chunks))):
-            chunks_to_analyze.append({
-                "position": f"inicio_{i+1}",
-                "content": chunks[i]['content'][:3000]  # Limitar tamaño
-            })
+        # Combinar el texto relevante
+        relevant_text = ""
+        for chunk in first_chunks:
+            relevant_text += chunk['content'][:2000] + "\n\n"
+        for chunk in last_chunks:
+            relevant_text += chunk['content'][:1000] + "\n\n"
         
-        # Últimos chunks (contraportada, bibliografía)
-        if len(chunks) > 3:
-            for i in range(max(0, len(chunks) - 2), len(chunks)):
-                if i >= 3:  # Evitar duplicados si el documento es corto
-                    chunks_to_analyze.append({
-                        "position": f"final_{i+1}",
-                        "content": chunks[i]['content'][:3000]
-                    })
+        # Limitar el texto total
+        relevant_text = relevant_text[:8000]
         
-        # Construir el texto para análisis
-        text_for_analysis = "\n\n---SECCIÓN---\n\n".join([
-            f"[{chunk['position']}]:\n{chunk['content']}" 
-            for chunk in chunks_to_analyze
-        ])
-        
-        # Prompt bilingüe para extracción
-        prompt = f"""Analiza el siguiente contenido extraído de un documento académico/libro y extrae la metadata.
-El contenido incluye secciones del inicio y final del documento.
+        # Prompt para extracción de metadata
+        prompt = f"""Analiza el siguiente texto extraído de un documento académico y extrae la siguiente información:
 
-CONTENIDO DEL DOCUMENTO:
-{text_for_analysis}
+1. **Título del libro/documento**: El título principal de la obra.
+2. **Autores**: Lista de autores en formato "Nombre Apellido". Si hay múltiples autores, sepáralos.
+3. **Fecha de publicación**: Año o fecha completa de publicación.
 
-INSTRUCCIONES:
-1. Busca el TÍTULO real del documento/libro (no el nombre del archivo)
-2. Busca los AUTORES (pueden estar como "Author", "Autor", "By", "Por", "Written by", "Escrito por")
-3. Busca la FECHA DE PUBLICACIÓN (puede aparecer como "Published", "Publicado", "Copyright ©", "Primera edición", "First edition", año de publicación)
+Nombre del archivo: {file_name}
 
-IMPORTANTE:
-- Busca en español e inglés
-- Para la fecha, extrae solo el año si no hay fecha completa
-- Si encuentras múltiples autores, inclúyelos todos
-- Si NO encuentras la información con certeza, indica "NO_ENCONTRADO"
+Texto del documento:
+---
+{relevant_text}
+---
 
-Responde ÚNICAMENTE con un JSON válido en este formato exacto:
+Responde SOLO en formato JSON con esta estructura exacta:
 {{
-    "title": "título encontrado o NO_ENCONTRADO",
-    "authors": ["autor1", "autor2"] o ["NO_ENCONTRADO"],
-    "publication_date": "fecha encontrada o NO_ENCONTRADO",
-    "confidence": {{
-        "title": "alta/media/baja",
-        "authors": "alta/media/baja",
-        "publication_date": "alta/media/baja"
-    }}
+    "title": "Título del libro" o "NO_ENCONTRADO",
+    "authors": ["Autor 1", "Autor 2"] o ["NO_ENCONTRADO"],
+    "publication_date": "YYYY" o "DD/MM/YYYY" o "NO_ENCONTRADO"
 }}
 
-Nombre del archivo (solo como referencia, NO uses esto como título): {file_name}"""
+IMPORTANTE:
+- Si no encuentras algún dato con certeza, usa "NO_ENCONTRADO"
+- Para autores, usa el formato "Nombre Apellido" (ej: "Stephen P. Robbins")
+- Para la fecha, preferiblemente extrae solo el año
+- Basa tu respuesta en el contenido del texto, no en el nombre del archivo"""
 
-        # Llamar a GPT-4o-mini
         response = openai_client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
-                {
-                    "role": "system",
-                    "content": "Eres un experto en catalogación de documentos académicos y libros. Extraes metadata con precisión. Siempre respondes en JSON válido."
-                },
-                {
-                    "role": "user",
-                    "content": prompt
-                }
+                {"role": "system", "content": "Eres un experto en extracción de metadata de documentos académicos. Respondes solo en JSON válido."},
+                {"role": "user", "content": prompt}
             ],
             temperature=0.1,
             max_tokens=500
@@ -627,7 +610,7 @@ Nombre del archivo (solo como referencia, NO uses esto como título): {file_name
         # Parsear respuesta
         response_text = response.choices[0].message.content.strip()
         
-        # Limpiar si viene con markdown
+        # Limpiar el JSON si viene con markdown
         if response_text.startswith("```"):
             response_text = response_text.split("```")[1]
             if response_text.startswith("json"):
@@ -636,22 +619,25 @@ Nombre del archivo (solo como referencia, NO uses esto como título): {file_name
         
         metadata = json.loads(response_text)
         
-        print(f"Metadata extraída: {metadata}")
+        print(f"Metadata extraída por LLM: {metadata}")
         return metadata
         
+    except json.JSONDecodeError as e:
+        print(f"Error parseando JSON de LLM: {str(e)}")
+        return {
+            "title": "NO_ENCONTRADO",
+            "authors": ["NO_ENCONTRADO"],
+            "publication_date": "NO_ENCONTRADO"
+        }
     except Exception as e:
-        print(f"Error extrayendo metadata con LLM: {str(e)}")
+        print(f"Error en extract_metadata_with_llm: {str(e)}")
         return {
             "title": "NO_ENCONTRADO",
             "authors": ["NO_ENCONTRADO"],
             "publication_date": "NO_ENCONTRADO",
-            "confidence": {
-                "title": "error",
-                "authors": "error",
-                "publication_date": "error"
-            },
             "error": str(e)
         }
+
 
 # ============================================================
 # FUNCIONES DE EXTRACCIÓN
