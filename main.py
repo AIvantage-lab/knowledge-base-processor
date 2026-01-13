@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import Dict, Any, List, Optional
@@ -21,6 +21,7 @@ import hashlib
 import time
 import json
 import re
+import asyncio
 
 app = FastAPI(title="Knowledge Base Processor Service")
 
@@ -28,6 +29,30 @@ app = FastAPI(title="Knowledge Base Processor Service")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 SUPABASE_URL = os.getenv("SUPABASE_URL", "https://hsoagaoxuaspkdptfgou.supabase.co")
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
+
+
+# ============================================================
+# DISTRIBUCIÓN DE PROGRESO POR ETAPAS
+# ============================================================
+# 0-5%:    Descarga del archivo
+# 5-25%:   Extracción de texto (incluye OCR si es necesario)
+# 25-30%:  Chunking y preparación
+# 30-95%:  Generación de embeddings e inserción
+# 95-100%: Extracción de metadata con LLM y finalización
+# ============================================================
+
+PROGRESS_STAGES = {
+    "download_start": 0.0,
+    "download_complete": 0.05,
+    "extraction_start": 0.05,
+    "extraction_complete": 0.25,
+    "chunking_start": 0.25,
+    "chunking_complete": 0.30,
+    "embeddings_start": 0.30,
+    "embeddings_complete": 0.95,
+    "metadata_start": 0.95,
+    "metadata_complete": 1.0
+}
 
 
 class ProcessDocumentRequest(BaseModel):
@@ -41,57 +66,159 @@ class ProcessDocumentRequest(BaseModel):
     publication_date: Optional[str] = None
 
 
+def get_supabase_client() -> Client:
+    """Crea y retorna un cliente de Supabase"""
+    return create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+
+
+def update_progress(supabase: Client, library_id: str, percentage: float, status: str = "processing"):
+    """
+    Actualiza el progreso en AIvantage_library.
+    
+    Args:
+        supabase: Cliente de Supabase
+        library_id: ID del documento en AIvantage_library
+        percentage: Porcentaje de progreso (0.0 a 1.0)
+        status: Estado del procesamiento
+    """
+    try:
+        supabase.table("AIvantage_library").update({
+            "loading_percentage": round(percentage, 3),
+            "status": status
+        }).eq("id", library_id).execute()
+        print(f"[Progreso] {percentage*100:.1f}% - {status}")
+    except Exception as e:
+        print(f"[Error actualizando progreso]: {str(e)}")
+
+
+def calculate_embeddings_progress(current_chunk: int, total_chunks: int) -> float:
+    """
+    Calcula el progreso dentro de la fase de embeddings (30-95%).
+    
+    Args:
+        current_chunk: Chunk actual procesado
+        total_chunks: Total de chunks
+    
+    Returns:
+        Porcentaje de progreso total (entre 0.30 y 0.95)
+    """
+    embeddings_range = PROGRESS_STAGES["embeddings_complete"] - PROGRESS_STAGES["embeddings_start"]
+    chunk_progress = current_chunk / total_chunks
+    return PROGRESS_STAGES["embeddings_start"] + (embeddings_range * chunk_progress)
+
+
 @app.get("/")
 async def health_check():
     return {"status": "healthy", "service": "knowledge-base-processor"}
 
 
 @app.post("/process")
-async def process_document(request: ProcessDocumentRequest):
+async def process_document(request: ProcessDocumentRequest, background_tasks: BackgroundTasks):
     """
-    Procesa un documento completo para la Knowledge Base:
-    1. Descarga el documento
-    2. Extrae el texto
-    3. Crea chunks
-    4. Genera embeddings
-    5. Almacena en Supabase (documents_v2)
-    6. Actualiza AIvantage_library
+    Endpoint asíncrono para procesar documentos.
+    
+    Responde inmediatamente con status "queued" y procesa en background.
+    El progreso se actualiza en tiempo real en AIvantage_library.
     """
     try:
-        # Validar configuración
+        # Validar configuración antes de encolar
         if not OPENAI_API_KEY:
             raise HTTPException(status_code=500, detail="OPENAI_API_KEY no configurada")
         if not SUPABASE_SERVICE_KEY:
             raise HTTPException(status_code=500, detail="SUPABASE_SERVICE_KEY no configurada")
         
-        # Inicializar clientes
-        openai_client = OpenAI(api_key=OPENAI_API_KEY)
-        supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+        # Inicializar Supabase para actualizar status inicial
+        supabase = get_supabase_client()
         
-        # Paso 1: Descargar el documento
-        print(f"Descargando documento: {request.file_url}")
-        async with httpx.AsyncClient(timeout=300.0) as client:
-            response = await client.get(request.file_url)
-            if response.status_code != 200:
-                # Actualizar status a error en AIvantage_library
-                supabase.table("AIvantage_library").update({
-                    "status": "error"
-                }).eq("id", request.library_id).execute()
-                raise HTTPException(status_code=400, detail=f"Error descargando archivo: {response.status_code}")
-            file_content = response.content
-        
-        print(f"Documento descargado: {len(file_content)} bytes")
-        
-        # Actualizar status a processing
+        # Marcar como "queued" inmediatamente
         supabase.table("AIvantage_library").update({
-            "status": "processing"
+            "status": "queued",
+            "loading_percentage": 0.0
         }).eq("id", request.library_id).execute()
         
-        # Paso 2: Extraer texto según tipo de archivo
-        file_extension = request.file_name.split('.')[-1].lower()
+        # Encolar el procesamiento en background
+        background_tasks.add_task(
+            process_document_background,
+            request.file_url,
+            request.library_id,
+            request.file_name,
+            request.subject,
+            request.subject_id,
+            request.authors,
+            request.title,
+            request.publication_date
+        )
+        
+        # Responder inmediatamente
+        return {
+            "success": True,
+            "status": "queued",
+            "message": "Documento encolado para procesamiento",
+            "library_id": request.library_id
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error en process_document: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+async def process_document_background(
+    file_url: str,
+    library_id: str,
+    file_name: str,
+    subject: str,
+    subject_id: Optional[str],
+    authors: Optional[List[str]],
+    title: Optional[str],
+    publication_date: Optional[str]
+):
+    """
+    Procesa un documento en background.
+    
+    Etapas:
+    1. Descarga el documento (0-5%)
+    2. Extrae el texto (5-25%)
+    3. Crea chunks (25-30%)
+    4. Genera embeddings e inserta (30-95%)
+    5. Extrae metadata con LLM (95-100%)
+    """
+    supabase = None
+    record_id = None
+    
+    try:
+        # Inicializar clientes
+        openai_client = OpenAI(api_key=OPENAI_API_KEY)
+        supabase = get_supabase_client()
+        
+        # ============================================================
+        # ETAPA 1: DESCARGA (0-5%)
+        # ============================================================
+        update_progress(supabase, library_id, PROGRESS_STAGES["download_start"], "downloading")
+        
+        print(f"[Etapa 1] Descargando documento: {file_url}")
+        async with httpx.AsyncClient(timeout=300.0) as client:
+            response = await client.get(file_url)
+            if response.status_code != 200:
+                update_progress(supabase, library_id, 0, "error")
+                print(f"[Error] No se pudo descargar el archivo: {response.status_code}")
+                return
+            file_content = response.content
+        
+        update_progress(supabase, library_id, PROGRESS_STAGES["download_complete"], "processing")
+        print(f"[Etapa 1] Documento descargado: {len(file_content)} bytes")
+        
+        # ============================================================
+        # ETAPA 2: EXTRACCIÓN DE TEXTO (5-25%)
+        # ============================================================
+        update_progress(supabase, library_id, PROGRESS_STAGES["extraction_start"], "extracting")
+        
+        file_extension = file_name.split('.')[-1].lower()
+        print(f"[Etapa 2] Extrayendo texto de archivo {file_extension}...")
         
         if file_extension == 'pdf':
-            extraction_result = await extract_pdf(file_content)
+            extraction_result = await extract_pdf_with_progress(file_content, supabase, library_id)
         elif file_extension in ['docx', 'doc']:
             extraction_result = await extract_docx(file_content)
         elif file_extension in ['xlsx', 'xls']:
@@ -103,19 +230,18 @@ async def process_document(request: ProcessDocumentRequest):
         elif file_extension in ['txt', 'md']:
             extraction_result = await extract_text(file_content)
         else:
-            supabase.table("AIvantage_library").update({
-                "status": "error"
-            }).eq("id", request.library_id).execute()
-            raise HTTPException(status_code=400, detail=f"Formato no soportado: {file_extension}")
+            update_progress(supabase, library_id, 0, "error")
+            print(f"[Error] Formato no soportado: {file_extension}")
+            return
         
         extracted_text = extraction_result.get('text', '')
         if not extracted_text or len(extracted_text.strip()) < 50:
-            supabase.table("AIvantage_library").update({
-                "status": "error"
-            }).eq("id", request.library_id).execute()
-            raise HTTPException(status_code=400, detail="No se pudo extraer texto suficiente del documento")
+            update_progress(supabase, library_id, 0, "error")
+            print("[Error] No se pudo extraer texto suficiente del documento")
+            return
         
-        print(f"Texto extraído: {len(extracted_text)} caracteres")
+        update_progress(supabase, library_id, PROGRESS_STAGES["extraction_complete"], "processing")
+        print(f"[Etapa 2] Texto extraído: {len(extracted_text)} caracteres")
         
         # Detectar idioma
         try:
@@ -123,46 +249,51 @@ async def process_document(request: ProcessDocumentRequest):
         except:
             language = 'unknown'
         
-        # Paso 3: Crear chunks
-        chunks = create_smart_chunks(extracted_text, chunk_size=4000, overlap=400)
-        print(f"Chunks creados: {len(chunks)}")
+        # ============================================================
+        # ETAPA 3: CHUNKING (25-30%)
+        # ============================================================
+        update_progress(supabase, library_id, PROGRESS_STAGES["chunking_start"], "chunking")
         
-        # Paso 4: Generar hash del documento
+        print("[Etapa 3] Creando chunks...")
+        chunks = create_smart_chunks(extracted_text, chunk_size=4000, overlap=400)
+        
+        # Generar hash del documento
         doc_hash = hashlib.md5(file_content).hexdigest()
         
-        # Paso 5: Insertar en record_manager_v2 (MODIFICADO: ahora incluye library_id)
+        # Insertar en record_manager_v2
         record_data = {
-            "file_path": request.file_url,
-            "file_name": request.file_name,
+            "file_path": file_url,
+            "file_name": file_name,
             "content_hash": doc_hash,
             "status": "processing",
             "total_chunks": len(chunks),
             "processed_chunks": 0,
-            "library_id": request.library_id  # NUEVO: referencia al libro
+            "library_id": library_id
         }
         
         record_result = supabase.table("record_manager_v2").insert(record_data).execute()
         
         if not record_result.data:
-            supabase.table("AIvantage_library").update({
-                "status": "error"
-            }).eq("id", request.library_id).execute()
-            raise HTTPException(status_code=500, detail="Error creando registro en record_manager_v2")
+            update_progress(supabase, library_id, 0, "error")
+            print("[Error] No se pudo crear registro en record_manager_v2")
+            return
         
         record_id = record_result.data[0]['id']
-        print(f"Record creado: {record_id}")
         
-        # ELIMINADO: Ya no actualizamos record_id en AIvantage_library
-        # La relación ahora es inversa: record_manager_v2.library_id -> AIvantage_library.id
+        update_progress(supabase, library_id, PROGRESS_STAGES["chunking_complete"], "processing")
+        print(f"[Etapa 3] Chunks creados: {len(chunks)}, Record ID: {record_id}")
         
-        # Paso 6: Procesar chunks en lotes
+        # ============================================================
+        # ETAPA 4: EMBEDDINGS E INSERCIÓN (30-95%)
+        # ============================================================
+        update_progress(supabase, library_id, PROGRESS_STAGES["embeddings_start"], "embedding")
+        
+        print("[Etapa 4] Generando embeddings...")
         batch_size = 20
         total_vectors_inserted = 0
         
         for i in range(0, len(chunks), batch_size):
             batch_chunks = chunks[i:i + batch_size]
-            
-            # Generar embeddings para el lote
             texts_to_embed = [chunk['content'] for chunk in batch_chunks]
             
             try:
@@ -180,16 +311,16 @@ async def process_document(request: ProcessDocumentRequest):
                     doc_record = {
                         "content": chunk['content'],
                         "metadata": {
-                            "file_name": request.file_name,
-                            "subject": request.subject,
-                            "subject_id": request.subject_id,
-                            "authors": request.authors,
-                            "title": request.title or request.file_name,
-                            "publication_date": request.publication_date,
+                            "file_name": file_name,
+                            "subject": subject,
+                            "subject_id": subject_id,
+                            "authors": authors,
+                            "title": title or file_name,
+                            "publication_date": publication_date,
                             "chunk_index": chunk_index,
                             "total_chunks": len(chunks),
                             "language": language,
-                            "library_id": request.library_id,
+                            "library_id": library_id,
                             "source": "knowledge_base"
                         },
                         "embedding": embedding_data.embedding,
@@ -199,111 +330,212 @@ async def process_document(request: ProcessDocumentRequest):
                 
                 # Insertar en documents_v2
                 if documents_to_insert:
-                    insert_result = supabase.table("documents_v2").insert(documents_to_insert).execute()
+                    supabase.table("documents_v2").insert(documents_to_insert).execute()
                     total_vectors_inserted += len(documents_to_insert)
                 
-                # Actualizar progreso
-                progress = min(i + batch_size, len(chunks))
+                # Actualizar progreso en record_manager_v2
+                progress_chunks = min(i + batch_size, len(chunks))
                 supabase.table("record_manager_v2").update({
-                    "processed_chunks": progress
+                    "processed_chunks": progress_chunks
                 }).eq("id", record_id).execute()
                 
-                # Actualizar loading_percentage en AIvantage_library
-                loading_pct = round(progress / len(chunks), 2)
-                supabase.table("AIvantage_library").update({
-                    "loading_percentage": loading_pct
-                }).eq("id", request.library_id).execute()
+                # Actualizar progreso en AIvantage_library (30-95%)
+                current_progress = calculate_embeddings_progress(progress_chunks, len(chunks))
+                update_progress(supabase, library_id, current_progress, "embedding")
                 
-                print(f"Lote procesado: {progress}/{len(chunks)} chunks ({loading_pct*100}%)")
+                print(f"[Etapa 4] Lote procesado: {progress_chunks}/{len(chunks)} chunks")
                 
                 # Pequeña pausa para evitar rate limits
                 if i + batch_size < len(chunks):
-                    time.sleep(0.5)
+                    await asyncio.sleep(0.5)
                     
             except Exception as e:
-                print(f"Error procesando lote {i}: {str(e)}")
+                print(f"[Error] Error procesando lote {i}: {str(e)}")
                 continue
         
-        # Paso 7: Actualizar estado final
+        # Actualizar estado en record_manager_v2
         supabase.table("record_manager_v2").update({
             "status": "completed",
             "processed_chunks": len(chunks)
         }).eq("id", record_id).execute()
         
-        supabase.table("AIvantage_library").update({
-            "status": "processed",
-            "loading_percentage": 1.0
-        }).eq("id", request.library_id).execute()
+        update_progress(supabase, library_id, PROGRESS_STAGES["embeddings_complete"], "finalizing")
+        print(f"[Etapa 4] Embeddings completados. Vectores insertados: {total_vectors_inserted}")
         
-        print(f"Procesamiento completado. Record ID: {record_id}, Vectores: {total_vectors_inserted}")
-
         # ============================================================
-        # PASO 8: EXTRAER Y ACTUALIZAR METADATA CON LLM
+        # ETAPA 5: EXTRACCIÓN DE METADATA CON LLM (95-100%)
         # ============================================================
-        print("Iniciando extracción de metadata con LLM...")
+        update_progress(supabase, library_id, PROGRESS_STAGES["metadata_start"], "extracting_metadata")
         
-        metadata_result = {"success": False, "changes_made": []}
+        print("[Etapa 5] Extrayendo metadata con LLM...")
         
         try:
             # Extraer metadata de los chunks
             extracted_metadata = await extract_metadata_with_llm(
                 chunks=chunks,
                 openai_client=openai_client,
-                file_name=request.file_name
+                file_name=file_name
             )
             
             # Obtener datos actuales de AIvantage_library para comparar
             current_library_data = supabase.table("AIvantage_library").select(
                 "title, authors, publication_date"
-            ).eq("id", request.library_id).execute()
+            ).eq("id", library_id).execute()
             
             if current_library_data.data:
                 current_data = current_library_data.data[0]
                 
-                # Comparar y actualizar si corresponde (MODIFICADO: usa library_id)
+                # Comparar y actualizar si corresponde
                 metadata_result = await compare_and_update_metadata(
                     extracted_metadata=extracted_metadata,
-                    library_id=request.library_id,
+                    library_id=library_id,
                     current_data=current_data,
                     supabase=supabase
                 )
                 
-                print(f"Metadata actualizada: {metadata_result.get('changes_made', [])}")
-            else:
-                print("No se encontró registro en AIvantage_library para actualizar metadata")
+                print(f"[Etapa 5] Metadata actualizada: {metadata_result.get('changes_made', [])}")
                 
         except Exception as e:
-            print(f"Error en extracción de metadata (no crítico): {str(e)}")
-            # No lanzamos excepción, el proceso principal ya completó exitosamente
+            print(f"[Etapa 5] Error en extracción de metadata (no crítico): {str(e)}")
         
-        return {
-            "success": True,
-            "record_id": record_id,
-            "library_id": request.library_id,
-            "total_chunks": len(chunks),
-            "total_vectors": total_vectors_inserted,
-            "language": language,
-            "file_name": request.file_name,
-            "metadata_extraction": {
-                "success": metadata_result.get("success", False),
-                "changes_made": metadata_result.get("changes_made", []),
-                "total_chunks_updated": metadata_result.get("total_chunks_updated", 0)
-            }
-        }
+        # ============================================================
+        # FINALIZACIÓN
+        # ============================================================
+        update_progress(supabase, library_id, PROGRESS_STAGES["metadata_complete"], "processed")
         
-    except HTTPException:
-        raise
+        print(f"[Completado] Documento procesado exitosamente.")
+        print(f"  - Library ID: {library_id}")
+        print(f"  - Record ID: {record_id}")
+        print(f"  - Total chunks: {len(chunks)}")
+        print(f"  - Total vectores: {total_vectors_inserted}")
+        
     except Exception as e:
-        print(f"Error en process_document: {str(e)}")
+        print(f"[Error Fatal] Error en process_document_background: {str(e)}")
+        
         # Intentar actualizar status a error
-        try:
-            supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
-            supabase.table("AIvantage_library").update({
-                "status": "error"
-            }).eq("id", request.library_id).execute()
-        except:
-            pass
-        raise HTTPException(status_code=500, detail=str(e))
+        if supabase:
+            try:
+                supabase.table("AIvantage_library").update({
+                    "status": "error",
+                    "loading_percentage": 0
+                }).eq("id", library_id).execute()
+                
+                if record_id:
+                    supabase.table("record_manager_v2").update({
+                        "status": "error"
+                    }).eq("id", record_id).execute()
+            except:
+                pass
+
+
+# ============================================================
+# FUNCIÓN DE EXTRACCIÓN DE PDF CON PROGRESO
+# ============================================================
+
+async def extract_pdf_with_progress(content: bytes, supabase: Client, library_id: str) -> Dict[str, Any]:
+    """
+    Extrae texto de PDF con reporte de progreso.
+    Incluye sub-progreso para OCR (5-25% del total).
+    """
+    result = {'text': '', 'pages': 0}
+    
+    # Sub-etapas dentro de extracción (5-25%)
+    extraction_start = PROGRESS_STAGES["extraction_start"]
+    extraction_end = PROGRESS_STAGES["extraction_complete"]
+    extraction_range = extraction_end - extraction_start
+    
+    try:
+        # Intentar extracción normal primero (rápido)
+        pdf_file = io.BytesIO(content)
+        pdf_reader = PyPDF2.PdfReader(pdf_file)
+        result['pages'] = len(pdf_reader.pages)
+        
+        text_parts = []
+        for page_num, page in enumerate(pdf_reader.pages):
+            page_text = page.extract_text()
+            if page_text and page_text.strip():
+                text_parts.append(f"--- Página {page_num + 1} ---\n{page_text}")
+        
+        result['text'] = '\n\n'.join(text_parts)
+        
+        # Si hay texto suficiente, terminamos (actualizar a 25%)
+        if result['text'].strip() and len(result['text']) >= 100:
+            return result
+        
+        # Intentar con pdfplumber
+        print("[Extracción] Intentando con pdfplumber...")
+        with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as tmp_file:
+            tmp_file.write(content)
+            tmp_path = tmp_file.name
+        
+        with pdfplumber.open(tmp_path) as pdf:
+            result['pages'] = len(pdf.pages)
+            text_parts = []
+            for i, page in enumerate(pdf.pages):
+                page_text = page.extract_text()
+                if page_text:
+                    text_parts.append(f"--- Página {i + 1} ---\n{page_text}")
+            result['text'] = '\n\n'.join(text_parts)
+        
+        os.unlink(tmp_path)
+        
+        # Si hay texto suficiente, terminamos
+        if result['text'].strip() and len(result['text']) >= 100:
+            return result
+        
+        # Si no hay texto, usar OCR (proceso largo)
+        print("[Extracción] Iniciando OCR (esto puede tomar varios minutos)...")
+        result['text'] = await extract_pdf_with_ocr_progress(content, supabase, library_id)
+            
+    except Exception as e:
+        print(f"[Error] Error extrayendo PDF: {e}")
+        print("[Extracción] Intentando OCR como fallback...")
+        result['text'] = await extract_pdf_with_ocr_progress(content, supabase, library_id)
+    
+    return result
+
+
+async def extract_pdf_with_ocr_progress(content: bytes, supabase: Client, library_id: str) -> str:
+    """
+    Extrae texto de PDF usando OCR con reporte de progreso por página.
+    El OCR ocupa la fase 5-25% del progreso total.
+    """
+    try:
+        # Convertir PDF a imágenes
+        images = convert_from_bytes(content, dpi=200)
+        total_pages = len(images)
+        
+        print(f"[OCR] Procesando {total_pages} páginas...")
+        
+        # Calcular progreso dentro del rango de extracción (5-25%)
+        extraction_start = PROGRESS_STAGES["extraction_start"]
+        extraction_end = PROGRESS_STAGES["extraction_complete"]
+        extraction_range = extraction_end - extraction_start
+        
+        text_parts = []
+        
+        for i, image in enumerate(images):
+            # Procesar página con OCR
+            text = pytesseract.image_to_string(image, lang='spa+eng')
+            text_parts.append(f"--- Página {i + 1} (OCR) ---\n{text}")
+            
+            # Actualizar progreso cada página
+            page_progress = (i + 1) / total_pages
+            current_progress = extraction_start + (extraction_range * page_progress)
+            update_progress(supabase, library_id, current_progress, "extracting_ocr")
+            
+            # Log cada 10 páginas o en la última
+            if (i + 1) % 10 == 0 or (i + 1) == total_pages:
+                print(f"[OCR] Página {i + 1}/{total_pages} procesada ({current_progress*100:.1f}%)")
+            
+            # Pequeña pausa para no bloquear el event loop
+            await asyncio.sleep(0.01)
+        
+        return '\n\n'.join(text_parts)
+        
+    except Exception as e:
+        print(f"[Error] Error en OCR: {str(e)}")
+        return f"Error en OCR: {str(e)}"
 
 
 # ============================================================
@@ -318,7 +550,6 @@ def format_publication_date(date_string: str) -> str:
     """
     if not date_string or date_string == "NO_ENCONTRADO":
         return "NO_IDENTIFICADO"
-    
     
     # Limpiar el string
     date_string = date_string.strip()
@@ -403,8 +634,6 @@ async def compare_and_update_metadata(
 ) -> Dict[str, Any]:
     """
     Compara la metadata extraída con la existente y actualiza si corresponde.
-    
-    MODIFICADO: Ahora busca documentos por library_id en metadata en lugar de record_id.
     
     Reglas:
     - Si campo vacío y hay dato extraído → actualizar con dato extraído
@@ -504,7 +733,6 @@ async def compare_and_update_metadata(
             print(f"AIvantage_library actualizado: {updates_library}")
         
         # Actualizar metadata en documents_v2 (todos los chunks del libro)
-        # MODIFICADO: Ahora busca por library_id en metadata en lugar de record_id
         docs_result = None
         if updates_documents:
             # Obtener todos los documentos con este library_id en metadata
@@ -716,7 +944,7 @@ def create_smart_chunks(text: str, chunk_size: int = 4000, overlap: int = 400) -
 
 
 async def extract_pdf(content: bytes) -> Dict[str, Any]:
-    """Extrae texto de PDF"""
+    """Extrae texto de PDF (versión sin progreso, para compatibilidad)"""
     result = {'text': '', 'pages': 0}
     
     try:
@@ -761,7 +989,7 @@ async def extract_pdf(content: bytes) -> Dict[str, Any]:
 
 
 async def extract_pdf_with_ocr(content: bytes) -> str:
-    """Extrae texto de PDF usando OCR"""
+    """Extrae texto de PDF usando OCR (versión sin progreso)"""
     try:
         images = convert_from_bytes(content, dpi=200)
         text_parts = []
